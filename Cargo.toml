@@ -8,5 +8,6 @@ edition = "2024"
 jack = "0.10"
 
 # CLAP host bindings for Rust
+clap = { version = "4.5", features = ["derive"] }
 clack-host = { git = "https://github.com/prokopyl/clack.git", package = "clack-host" }
 clack-plugin = { git = "https://github.com/prokopyl/clack.git", package = "clack-plugin" }
