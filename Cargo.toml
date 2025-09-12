@@ -4,3 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# JACK client library (same one we used for the sine demo)
+jack = "0.10"
+
+# CLAP host bindings for Rust
+clack-host = { git = "https://github.com/prokopyl/clack.git", package = "clack-host" }
+clack-plugin = { git = "https://github.com/prokopyl/clack.git", package = "clack-plugin" }
