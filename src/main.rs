@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{path::PathBuf};
 use clap::Parser;
 
 use clack_host::prelude::*;
@@ -11,7 +11,7 @@ use jack::{Client, ClientOptions, Control, ProcessHandler, ProcessScope, AudioOu
 #[command(version, about = "CLAP -> JACK: run LSP Noise Generator through JACK")]
 struct Args {
     /// Path to a .clap bundle (e.g. /usr/lib/clap/lsp-plugins.clap)
-    plugin: Option<PathBuf>,
+    plugin: PathBuf,
 }
 
 /* ------- minimal clack host scaffolding ------- */
@@ -32,10 +32,7 @@ impl HostHandlers for MyHost {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    let plugin_path = if let Some(p) = args.plugin { p } else {
-        eprintln!("No plugin path provided.\nTry: cargo run -- /usr/lib/clap/<plugin>.clap");
-        std::process::exit(2);
-    };
+    let plugin_path = args.plugin;
 
     println!("Loading bundle: {}", plugin_path.display());
 
@@ -189,32 +186,4 @@ impl ProcessHandler for JackHandler {
 
         Control::Continue
     }
-}
-
-/// Try to find a plausible CLAP bundle
-fn auto_find_plugin() -> Option<PathBuf> {
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Ok(cp) = std::env::var("CLAP_PATH") {
-        dirs.extend(cp.split(':').map(PathBuf::from));
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        dirs.push(PathBuf::from(home).join(".clap"));
-    }
-    dirs.push(PathBuf::from("/usr/lib/clap"));
-
-    let mut candidates = Vec::new();
-    for d in dirs {
-        if d.is_dir() {
-            if let Ok(entries) = fs::read_dir(&d) {
-                for e in entries.flatten() {
-                    let p = e.path();
-                    if p.extension().and_then(|s| s.to_str()) == Some("clap") || p.is_dir() {
-                        candidates.push(p);
-                    }
-                }
-            }
-        }
-    }
-    candidates.sort();
-    candidates.into_iter().next()
 }
