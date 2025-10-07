@@ -154,7 +154,7 @@ impl ProcessHandler for JackHandler {
         let mut output_events = OutputEvents::from_buffer(&mut output_events_buf);
 
         // Attach input (silent stereo) and output (our scratch) buffers
-        let mut in_audio = input_ports.with_input_buffers([AudioPortBuffer {
+        let in_audio = input_ports.with_input_buffers([AudioPortBuffer {
             latency: 0,
             channels: AudioPortBufferType::f32_input_only(
                 // IMPORTANT: pass **mutable** slices to InputChannel::constant(...)
