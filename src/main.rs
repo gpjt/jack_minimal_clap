@@ -1,17 +1,20 @@
 use std::{fs, path::PathBuf};
-use std::ffi::CStr;
 use clap::Parser;
+
 use clack_host::prelude::*;
-use clack_host::events::event_types::*; // (not used yet, but handy next step)
+use clack_host::events::io::{InputEvents, OutputEvents, EventBuffer};
+use clack_host::prelude::UnknownEvent;
+
+use jack::{Client, ClientOptions, Control, ProcessHandler, ProcessScope, AudioOut, Port};
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Hello CLAP host: list plugin descriptors and instantiate LSP Oscillator")]
+#[command(version, about = "CLAP -> JACK: run LSP Noise Generator through JACK")]
 struct Args {
     /// Path to a .clap bundle (e.g. /usr/lib/clap/lsp-plugins.clap)
     plugin: Option<PathBuf>,
 }
 
-/* --- Minimal host scaffolding required by clack --- */
+/* ------- minimal clack host scaffolding ------- */
 struct MyHostShared;
 impl<'a> SharedHandler<'a> for MyHostShared {
     fn request_restart(&self) {}
@@ -24,110 +27,173 @@ impl HostHandlers for MyHost {
     type MainThread<'a> = ();
     type AudioProcessor<'a> = ();
 }
-/* -------------------------------------------------- */
+/* --------------------------------------------- */
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    let plugin_path = if let Some(p) = args.plugin {
-        p
-    } else {
-        auto_find_plugin().unwrap_or_else(|| {
-            eprintln!("No plugin path provided and auto-discovery failed.\nTry: cargo run -- /usr/lib/clap/<plugin>.clap");
-            std::process::exit(2);
-        })
+    let plugin_path = if let Some(p) = args.plugin { p } else {
+        eprintln!("No plugin path provided.\nTry: cargo run -- /usr/lib/clap/<plugin>.clap");
+        std::process::exit(2);
     };
 
     println!("Loading bundle: {}", plugin_path.display());
 
-    // Load the .clap bundle (unsafe: loading foreign code)
+    // Load bundle (FFI boundary)
     let bundle = unsafe { PluginBundle::load(&plugin_path) }
         .map_err(|e| format!("Failed to load bundle: {e:?}"))?;
 
-    // Get the factory and enumerate descriptors
     let factory = bundle
         .get_plugin_factory()
         .ok_or("Bundle has no plugin factory")?;
 
-    let mut any = false;
-    for desc in factory.plugin_descriptors() {
-        any = true;
-
-        let id      = desc.id()     .map(|c: &CStr| c.to_string_lossy().into_owned()).unwrap_or_else(|| "(no id)".into());
-        let name    = desc.name()   .map(|c: &CStr| c.to_string_lossy().into_owned()).unwrap_or_else(|| "(unnamed)".into());
-        let vendor  = desc.vendor() .map(|c: &CStr| c.to_string_lossy().into_owned()).unwrap_or_else(|| "(unknown vendor)".into());
-        let version = desc.version().map(|c: &CStr| c.to_string_lossy().into_owned()).unwrap_or_else(|| "(unknown version)".into());
-
-        println!("---");
-        println!("ID:      {id}");
-        println!("Name:    {name}");
-        println!("Vendor:  {vendor}");
-        println!("Version: {version}");
-    }
-
-    if !any {
-        eprintln!("No descriptors found in bundle");
-        std::process::exit(3);
-    }
-
-    // ---- Instantiate the LSP Oscillator Mono using the current clack API ----
-    let target_id = "in.lsp-plug.oscillator_mono";
+    // Choose a generator that needs no MIDI
+    let target_id = "in.lsp-plug.noise_generator_x1";
     let mut target_desc = None;
-    for desc in factory.plugin_descriptors() {
-        if let Some(id) = desc.id() {
+    for d in factory.plugin_descriptors() {
+        if let Some(id) = d.id() {
             if id.to_string_lossy() == target_id {
-                target_desc = Some(desc);
+                target_desc = Some(d);
                 break;
             }
         }
     }
+    let Some(desc) = target_desc else {
+        eprintln!("Could not find {target_id} in this bundle.");
+        std::process::exit(3);
+    };
 
-    if let Some(desc) = target_desc {
-        println!("\nInstantiating {target_id}…");
+    println!("Instantiating {target_id}…");
 
-        // Host identity now needs (name, vendor, url, version) and returns Result.
-        let host_info = HostInfo::new(
-            "jack_minimal_clap",
-            "Giles",
-            "https://example.invalid",  // arbitrary URL
-            "0.1.0",
-        )?;
+    // Host identity (name, vendor, url, version)
+    let host_info = HostInfo::new(
+        "jack_minimal_clap",
+        "Giles",
+        "https://example.invalid",
+        "0.1.0",
+    )?;
 
-        // Create a PluginInstance via clack’s high-level helper.
-        let mut instance = PluginInstance::<MyHost>::new(
-            |_| MyHostShared,             // construct Shared
-            |_| (),                       // construct MainThread
-            &bundle,
-            desc.id().expect("descriptor must have an id"),
-            &host_info,
-        )?;
+    // Create instance
+    let mut instance = PluginInstance::<MyHost>::new(
+        |_| MyHostShared,
+        |_| (),
+        &bundle,
+        desc.id().expect("descriptor must have id"),
+        &host_info,
+    )?;
 
-        // Activate with a plausible audio config (we’ll wire real JACK values later).
-        let audio_cfg = PluginAudioConfiguration {
-            sample_rate: 48_000.0,
-            min_frames_count: 256,
-            max_frames_count: 512,
-        };
-        let audio_proc = instance.activate(|_, _| (), audio_cfg)?; // () for AudioProcessor state
+    // Open JACK first to use its real SR / block size
+    let (jack_client, _status) = Client::new("clap_to_jack", ClientOptions::NO_START_SERVER)
+        .expect("JACK not available");
+    let sample_rate = jack_client.sample_rate() as f64;
+    let frames      = jack_client.buffer_size() as u32;
+    println!("JACK: sr={sample_rate}, buffer={frames}");
 
-        // Start/stop just to prove the lifecycle works.
-        let audio_proc = audio_proc.start_processing()?;
-        let audio_proc = audio_proc.stop_processing();
-        instance.deactivate(audio_proc);
+    // Activate plugin with JACK params
+    let audio_cfg = PluginAudioConfiguration {
+        sample_rate,
+        min_frames_count: frames,
+        max_frames_count: frames,
+    };
+    let audio_proc_stopped = instance.activate(|_, _| (), audio_cfg)?;
+    let audio_proc_started = audio_proc_stopped.start_processing()?;
 
-        println!("Instance created and activated successfully ✅");
-    } else {
-        eprintln!("\nCould not find {target_id} in this bundle.");
-    }
-    // ------------------------------------------------------------------------
+    // Register JACK outs
+    let out_l = jack_client.register_port("out_l", AudioOut::default()).expect("jack L");
+    let out_r = jack_client.register_port("out_r", AudioOut::default()).expect("jack R");
 
-    Ok(())
+    // Move processor into handler
+    let handler = JackHandler {
+        proc: audio_proc_started,
+        out_l,
+        out_r,
+        in_l: Vec::new(),
+        in_r: Vec::new(),
+        scratch_l: Vec::new(),
+        scratch_r: Vec::new(),
+    };
+    let _active = jack_client.activate_async((), handler).expect("activate JACK failed");
+
+    println!("Running. Connect to playback, e.g.:");
+    println!("  jack_connect \"clap_to_jack:out_l\" \"USB Audio Analog Stereo:playback_FL\"");
+    println!("  jack_connect \"clap_to_jack:out_r\" \"USB Audio Analog Stereo:playback_FR\"");
+    println!("Ctrl+C to quit.");
+    loop { std::thread::park(); }
 }
 
-/// Try to find a plausible synth in standard CLAP locations.
+// JACK handler that calls the CLAP plugin each block
+struct JackHandler {
+    proc: clack_host::process::StartedPluginAudioProcessor<MyHost>,
+    out_l: Port<AudioOut>,
+    out_r: Port<AudioOut>,
+    // silent input we'll hand to the plugin
+    in_l: Vec<f32>,
+    in_r: Vec<f32>,
+    // plugin output scratch (copied to JACK)
+    scratch_l: Vec<f32>,
+    scratch_r: Vec<f32>,
+}
+
+impl ProcessHandler for JackHandler {
+    fn process(&mut self, _client: &Client, ps: &ProcessScope) -> Control {
+        let out_l = self.out_l.as_mut_slice(ps);
+        let out_r = self.out_r.as_mut_slice(ps);
+        let n = out_l.len();
+
+        // Ensure buffers are the right size
+        if self.in_l.len() != n { self.in_l.resize(n, 0.0); }
+        if self.in_r.len() != n { self.in_r.resize(n, 0.0); }
+        if self.scratch_l.len() != n { self.scratch_l.resize(n, 0.0); }
+        if self.scratch_r.len() != n { self.scratch_r.resize(n, 0.0); }
+
+        // Build clack audio ports: 1 input port (silent stereo), 1 output port (stereo)
+        let mut input_ports  = AudioPorts::with_capacity(2, 1);
+        let mut output_ports = AudioPorts::with_capacity(2, 1);
+
+        // Explicitly-typed EMPTY input event buffer — slice of references
+        let empty_in: [&UnknownEvent; 0] = [];
+        let input_events = InputEvents::from_buffer(&empty_in);
+        let mut output_events_buf = EventBuffer::new();
+        let mut output_events = OutputEvents::from_buffer(&mut output_events_buf);
+
+        // Attach input (silent stereo) and output (our scratch) buffers
+        let mut in_audio = input_ports.with_input_buffers([AudioPortBuffer {
+            latency: 0,
+            channels: AudioPortBufferType::f32_input_only(
+                // IMPORTANT: pass **mutable** slices to InputChannel::constant(...)
+                [&mut self.in_l[..], &mut self.in_r[..]]
+                    .into_iter()
+                    .map(InputChannel::constant)
+            )
+        }]);
+        let mut out_audio = output_ports.with_output_buffers([AudioPortBuffer {
+            latency: 0,
+            channels: AudioPortBufferType::f32_output_only(
+                [&mut self.scratch_l[..], &mut self.scratch_r[..]].into_iter()
+            )
+        }]);
+
+        // Process one JACK block
+        let _status = self.proc.process(
+            &in_audio,
+            &mut out_audio,
+            &input_events,
+            &mut output_events,
+            None,
+            None
+        ).unwrap_or(ProcessStatus::Continue);
+
+        // Copy to JACK
+        out_l.copy_from_slice(&self.scratch_l);
+        out_r.copy_from_slice(&self.scratch_l);
+
+        Control::Continue
+    }
+}
+
+/// Try to find a plausible CLAP bundle
 fn auto_find_plugin() -> Option<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
-
     if let Ok(cp) = std::env::var("CLAP_PATH") {
         dirs.extend(cp.split(':').map(PathBuf::from));
     }
@@ -149,19 +215,6 @@ fn auto_find_plugin() -> Option<PathBuf> {
             }
         }
     }
-    if candidates.is_empty() {
-        return None;
-    }
-
-    // Prefer names with "osc" or "synth"
     candidates.sort();
-    candidates.into_iter().find(|p| {
-        p.file_name()
-            .and_then(|n| n.to_str())
-            .map(|s| {
-                let s = s.to_ascii_lowercase();
-                s.contains("osc") || s.contains("synth")
-            })
-            .unwrap_or(false)
-    })
+    candidates.into_iter().next()
 }
